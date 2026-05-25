@@ -1,0 +1,9 @@
+flask
+rapidfuzz
+requests
+pydantic
+sentence-transformers
+torch
+numpy
+openai
+python-dotenv
