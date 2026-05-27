@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
 import os
 import re
@@ -11,6 +12,7 @@ import torch
 import numpy as np
 from datetime import datetime, timezone
 from dataclasses import dataclass
+from collections import Counter
 from typing import Dict, List, Optional, Tuple, Union
 
 import requests
@@ -82,6 +84,7 @@ load_dotenv()
 
 EMBEDDING_MODEL = "text-embedding-bge-m3"
 VECTOR_SEARCHER: Optional["VectorSearcher"] = None
+BM25_INDEX: Optional["BM25Index"] = None
 DEBUG_CSV_PATH = os.getenv("DEBUG_CSV_PATH", "debug_candidates.csv").strip()
 
 app = Flask(__name__)
@@ -104,6 +107,7 @@ class FaqRecord:
     answer: str
     updated: str
     search_text: str
+    synonyms: str = ""
 
 
 class KeywordOutput(BaseModel):
@@ -113,6 +117,7 @@ class KeywordOutput(BaseModel):
 
 class ScoreEntry(BaseModel):
     id: str
+    reasoning: str
     score: float
 
 
@@ -132,12 +137,44 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 
+def is_cjk(char: str) -> bool:
+    code = ord(char)
+    return (
+        0x4E00 <= code <= 0x9FFF
+        or 0x3400 <= code <= 0x4DBF
+        or 0x20000 <= code <= 0x2A6DF
+    )
+
+
+def tokenize_bm25(text: str) -> List[str]:
+    text = normalize_text(text)
+    if not text:
+        return []
+    tokens = re.findall(r"[a-z0-9]+", text)
+    # 找出所有連續的 CJK (中文) 片段，並在片段內部進行 Unigram 與 Bigram 斷詞
+    cjk_pattern = r"[\u4e00-\u9fff\u3400-\u4dbf\U00020000-\U0002a6df]+"
+    cjk_chunks = re.findall(cjk_pattern, text)
+    for chunk in cjk_chunks:
+        # Unigram (單字)
+        for char in chunk:
+            tokens.append(char)
+        # Bigram (雙字連詞)
+        for i in range(len(chunk) - 1):
+            tokens.append(chunk[i] + chunk[i + 1])
+    return tokens
+
+
 CONFLICT_GROUPS = [
     {"pph", "aep", "tw-supa"},
     {"申請人", "發明人", "專利代理人"},  # 關係人衝突：代理人、申請人與發明人為不同主體，提問與 FAQ 條目若角色不一致則判定為衝突
     {"發明", "新型", "設計"},            # 專利類型衝突：發明、新型與設計專利適用不同規定，若類型不一致則判定為衝突
-    {"實體審查", "新型技術報告"}        # 審查程序衝突：實體審查與新型技術報告互斥，若不一致則判定為衝突
+    {"實體審查", "新型技術報告"},        # 審查程序衝突：實體審查與新型技術報告互斥，若不一致則判定為衝突
+    {"更正", "補換發"},                  # 「專利權更正」vs「補換發專利證書」概念衝突
+    {"延長", "延緩"},                    # 「專利權期間延長」vs「延緩實體審查」概念衝突
+    {"年費", "申請規費"},                # 繳費類型衝突
 ]
+
+
 def check_conflict(query_text: str, record_question: str) -> bool:
     q_lower = query_text.lower()
     r_lower = record_question.lower()
@@ -146,6 +183,10 @@ def check_conflict(query_text: str, record_question: str) -> bool:
         # 1. 檢查用戶提問中是否包含此群組的成員
         q_present = {member for member in group if member in q_lower}
         
+        # 如果用戶提問中包含同一衝突群組中的多個成員，代表用戶在詢問涵蓋多個角色的通用問題，不應觸發衝突
+        if len(q_present) > 1:
+            continue
+            
         # 2. 如果用戶提問中包含此群組的成員，則繼續比對 FAQ 條目
         if q_present:
             # 3. 檢查 FAQ 題目中是否也包含該衝突群組的成員
@@ -188,11 +229,16 @@ def load_faq(csv_path: str) -> List[FaqRecord]:
             ).strip()
             updated = (row.get("\u66f4\u65b0\u65e5\u671f") or row.get("updated") or "").strip()
             record_id = (row.get("\u9805\u6b21") or str(index)).strip()
+            synonyms = (
+                row.get("\u5ef6\u4f38\u554f\u984c")
+                or row.get("synonyms")
+                or ""
+            ).strip()
 
             if not question or not answer:
                 continue
 
-            search_text = normalize_text(question)
+            search_text = normalize_text(f"{question} {synonyms}" if synonyms else question)
             records.append(
                 FaqRecord(
                     record_id=record_id,
@@ -201,6 +247,7 @@ def load_faq(csv_path: str) -> List[FaqRecord]:
                     answer=answer,
                     updated=updated,
                     search_text=search_text,
+                    synonyms=synonyms,
                 )
             )
 
@@ -286,25 +333,30 @@ def check_coverage(query: str, best_record: "FaqRecord", client: Optional[OpenAI
     if not client:
         return True  # 無 LLM 時保守預設：不觸發 RAG
     prompt = (
-        """你是專利問答系統的覆蓋判斷員。
-以下是系統認為最相關的 FAQ 條目。
+        """你是專利問答系統的「覆蓋判斷員」暨「RAG 守門員」。
+以下是系統檢索出最相關的單一 FAQ 條目。
 
 ### 💡 背景定位說明
 1. 用戶提問：用戶針對專利業務提出的具體實務問題。
-2. FAQ 條目：來自「中華民國智慧財產局專利常見問答 FAQ 文件」，是用於向一般大眾解答專利申請與行政操作中常見疑問的便民指南。其中「問題」是整理出的常見提問情境，「答案」則是官方窗口提供的實務解答與指引。
-您的任務是判斷該 FAQ 條目的「答案」是否在實質內容上，已經完整且足夠回答用戶提問所關心的實務問題，不要因為兩者字面口語或敘述方式的差異而輕易否定。
+2. FAQ 條目：來自「中華民國智慧財產局專利常見問答 FAQ 文件」。
+你的核心任務是把關：**是否真的需要觸發耗時且發散的 RAG 流程？** 因為前方的檢索系統已經選出置信度最高的條目，若該 FAQ 的「答案」核心資訊已經足夠解答用戶提問，你必須判定為覆蓋 (has_coverage = true)，讓系統直接回傳該 FAQ，避免濫用 RAG。
 
-### 🚨 極重要：日常口語同義改寫的寬容判定準則（防止過度嚴苛誤判）
-- **口語修飾與包裝**：用戶常在同義改寫時加入日常修飾性動作詞（例如「手續要怎麼辦理」、「費用是多少」、「我們要去哪裡辦」、「我們最晚要在什麼時候」等）。只要 FAQ 條目的答案實質上提供了這些程序所需的全部核心實務資訊（例如提供了規費金額、書面提出等程序），**就必須判定為 has_coverage = True**。
-- **不可吹毛求疵**：嚴禁因為字面同義詞不同（例如提問寫「服務時段」，答案寫「開放時間」或「收件時間」；提問寫「不再提供」，答案寫「仍會提供選擇」；提問寫「回台灣還要寄存嗎」，答案寫「仍應於我國補寄存/無須再於我國寄存」）而判定為不覆蓋。
+### 🚨 判斷覆蓋度之核心準則（極重要）
+1. **口語修飾詞的寬容判定（防止過度嚴苛）**：用戶常在提問中加入日常修飾性定語或副詞（如「具體是」、「最晚」、「哪些」、「到底」等）來加強語氣。只要 FAQ 答案的核心內容或所包含 the 法條規定，實質上已經涵蓋了該修飾詞所指向的實務資訊，就必須判定為 `has_coverage = true`。
+   - *例如*：用戶問「最晚什麼時候舉發」，FAQ 答案回「任何人得於專利權期間內提起舉發」— 雖然答案沒有使用「最晚」字眼，但其給出的時間期限「專利權期間內」已經實質回答了最晚時間，必須判定為 `has_coverage = true`。
+   - *例如*：用戶問「實體審查是審查哪些要件」，FAQ 答案已簡述了實體審查的定義與對象，只要整體回答內容對應該程序，就判定為 `has_coverage = true`，不可因沒有逐一條列所有要件就判定不覆蓋。
+2. **定義與條件的互相涵蓋**：
+   - 用戶問「某專利定義」→ FAQ 題目是「何謂某專利？」→ has_coverage = true。
+   - 用戶問「某程序在什麼情況下可以申請？」→ FAQ 題目是「何謂某程序？」或「申請程序為何？」→ 只要答案內含適用條件，has_coverage = true。
+   - 用戶問「A與B的不同」→ FAQ 題目是「何謂A？」→ 若答案中有對比B，has_coverage = true；若無對比B，has_coverage = false。
+3. **複合提問 (Multi-part Query) 的覆蓋判定**：
+   - 若用戶一口氣詢問多個獨立問題（如：同時問時間與規費），請在 `is_multi_part_query` 標記為 true。
+   - **注意**：複合提問不代表一定無法覆蓋！如果該 FAQ 條目的答案，**剛好完整解答了用戶提出的「所有」子問題**，`has_coverage` 依然必須為 true。
+   - 只有當用戶的問題包含 A 與 B 兩部分，但 FAQ 僅回答了 A 而遺漏 B 時，`has_coverage` 才判定為 false（此時系統才會啟動 RAG 整合其他知識）。
 
-你必須遵循「拆解與推理思考程序（Chain-of-Thought）」：
-1. reasoning_process：請先以 1-2 句話，列出用戶提問與 FAQ 問題的語意對比過程。分析用戶問題的「核心法律意圖」，並對照此 FAQ 的解答。
-2. is_multi_part_query：判斷用戶是否是「複合提問」（即一口氣問了兩個或以上，完全不同主題的獨立問題，例如問了時間又問規費）。如果只是單一問題的口語改寫或同義詞變換，此欄位必須為 false。
-3. has_coverage：在 is_multi_part_query 為 false 的前提下，若本條目的「答案」已經能完整且充分解答用戶的核心疑問，此欄位應為 true。請秉持寬容判斷標準：避免在字面同義詞上過度糾結。
-
-只有當用戶是「複合提問（問了多件不同的事情，而此答案僅回答了其中一部分）」，或者「問題與答案的主題完全不契合，需要整合其他 FAQ 條目」時，has_coverage 才可以為 false。"""
-        f"\n\n用戶提問：{query}"
+### 輸出思考程序 (Chain-of-Thought)
+在生成 JSON 結構時，請務必先在 `reasoning_process` 欄位以 1-2 句話寫出語意對比過程：分析用戶問題的「核心法律意圖 / 所有子問題」，並對照 FAQ 解答是否已無死角地涵蓋所有疑問。"""
+        f"\n用戶提問：{query}"
         f"\nFAQ 問題：{best_record.question}"
         f"\nFAQ 答案：{best_record.answer}"
     )
@@ -467,11 +519,21 @@ class VectorSearcher:
                     cache_data = json.load(f)
                 
                 # 檢查快取資料格式是否正確，並比對模型名稱是否一致
-                # 如果格式無誤且為 Dict，則載入快取向量
                 if isinstance(cache_data, dict) and "model_name" in cache_data:
                     if cache_data.get("model_name") == EMBEDDING_MODEL:
                         self.embeddings = cache_data.get("embeddings", {})
-                        if all(r.record_id in self.embeddings for r in self.records):
+                        # 檢查是否所有必要的 record_id_q 與 record_id_s 都已經有快取向量
+                        all_cached = True
+                        for r in self.records:
+                            q_key = f"{r.record_id}_q"
+                            s_key = f"{r.record_id}_s"
+                            if q_key not in self.embeddings:
+                                all_cached = False
+                                break
+                            if getattr(r, "synonyms", None) and s_key not in self.embeddings:
+                                all_cached = False
+                                break
+                        if all_cached:
                             logging.info("Loaded FAQ embeddings from cache (%s).", EMBEDDING_MODEL)
                             return
                 
@@ -480,11 +542,25 @@ class VectorSearcher:
                 logging.exception("Failed to load embeddings cache")
 
         logging.info("Building FAQ embeddings cache using %s...", EMBEDDING_MODEL)
-        texts = [r.question for r in self.records]
-        all_values = get_embeddings(texts, self.client)
+        
+        # [Embedding 技術限制標記 - 多向量最大相似度設計 (Multi-Vector Max Similarity)]
+        # 由於 BGE-M3 等 Dense Embedding 模型在極短句（≤ 10 字，如「何謂新型？」）上的語義空間特徵較為稀疏，
+        # 難以直接與使用者具體、長篇幅的口語或法律術語（如「新型專利具體的法律定義到底是什麼？」）進行精準匹配。
+        # 同時，若直接字串拼接會造成「前綴稀釋效應」，反而拉低餘弦相似度。
+        # 因此，我們將「原始題目」與「延伸問題」作為兩個獨立向量進行 Embedding 編碼，檢檢索時計算兩者相似度並取最大值 (MAX)。
+        keys_to_embed = []
+        texts_to_embed = []
+        for r in self.records:
+            keys_to_embed.append(f"{r.record_id}_q")
+            texts_to_embed.append(r.question)
+            if getattr(r, "synonyms", None):
+                keys_to_embed.append(f"{r.record_id}_s")
+                texts_to_embed.append(r.synonyms)
 
-        if len(all_values) == len(self.records):
-            self.embeddings = {r.record_id: v for r, v in zip(self.records, all_values)}
+        all_values = get_embeddings(texts_to_embed, self.client)
+
+        if len(all_values) == len(keys_to_embed):
+            self.embeddings = {k: v for k, v in zip(keys_to_embed, all_values)}
             try:
                 # 快取資料寫入檔案以供後續使用
                 cache_to_save = {
@@ -512,14 +588,22 @@ class VectorSearcher:
         best_record = None
         best_score = -1.0
 
-        # 這裡可以使用張量運算進行矩陣乘法，但為了保持單條比對的清晰性，我們使用迴圈進行
         for record in self.records:
-            if record.record_id not in self.embeddings:
-                continue
-            vec_tensor = torch.tensor(self.embeddings[record.record_id])
+            q_key = f"{record.record_id}_q"
+            s_key = f"{record.record_id}_s"
             
-            # 使用 sentence_transformers.util.cos_sim
-            score = util.cos_sim(query_vec_tensor, vec_tensor).item()
+            score_q = -1.0
+            score_s = -1.0
+            
+            if q_key in self.embeddings:
+                vec_q = torch.tensor(self.embeddings[q_key])
+                score_q = util.cos_sim(query_vec_tensor, vec_q).item()
+                
+            if getattr(record, "synonyms", None) and s_key in self.embeddings:
+                vec_s = torch.tensor(self.embeddings[s_key])
+                score_s = util.cos_sim(query_vec_tensor, vec_s).item()
+                
+            score = max(score_q, score_s)
 
             if score > best_score:
                 best_score = float(score)
@@ -540,16 +624,90 @@ class VectorSearcher:
         
         results = []
         for record in self.records:
-            if record.record_id not in self.embeddings:
-                continue
-            vec_tensor = torch.tensor(self.embeddings[record.record_id])
+            q_key = f"{record.record_id}_q"
+            s_key = f"{record.record_id}_s"
             
-            # 使用 sentence_transformers.util.cos_sim
-            score = util.cos_sim(query_vec_tensor, vec_tensor).item()
-            results.append((record, float(score)))
+            score_q = -1.0
+            score_s = -1.0
+            
+            if q_key in self.embeddings:
+                vec_q = torch.tensor(self.embeddings[q_key])
+                score_q = util.cos_sim(query_vec_tensor, vec_q).item()
+                
+            if getattr(record, "synonyms", None) and s_key in self.embeddings:
+                vec_s = torch.tensor(self.embeddings[s_key])
+                score_s = util.cos_sim(query_vec_tensor, vec_s).item()
+                
+            best_score = max(score_q, score_s)
+            results.append((record, float(best_score)))
 
         results.sort(key=lambda item: item[1], reverse=True)
         return results[:top_k]
+
+
+class BM25Index:
+    def __init__(self, records: List[FaqRecord], k1: float = 1.5, b: float = 0.75):
+        self.records = records
+        self.k1 = k1
+        self.b = b
+        self.record_ids = [r.record_id for r in records]
+        self.doc_count = len(records)
+        self.doc_len: Dict[str, int] = {}
+        self.term_freqs: Dict[str, Counter] = {}
+        self.doc_freq: Dict[str, int] = {}
+        self.avgdl = 0.0
+        self._build()
+
+    def matches(self, records: List[FaqRecord]) -> bool:
+        if len(records) != len(self.record_ids):
+            return False
+        return self.record_ids == [r.record_id for r in records]
+
+    def _build(self) -> None:
+        total_len = 0
+        for record in self.records:
+            # 合併題目與延伸問題以建立更健壯的 BM25 詞彙索引
+            text_to_tokenize = record.question
+            if getattr(record, "synonyms", None):
+                text_to_tokenize = f"{record.question} {record.synonyms}"
+            tokens = tokenize_bm25(text_to_tokenize)
+            freq = Counter(tokens)
+            self.term_freqs[record.record_id] = freq
+            doc_len = sum(freq.values())
+            self.doc_len[record.record_id] = doc_len
+            total_len += doc_len
+            for term in freq.keys():
+                self.doc_freq[term] = self.doc_freq.get(term, 0) + 1
+
+        self.avgdl = total_len / max(self.doc_count, 1)
+
+    def score(self, query: str) -> Dict[str, float]:
+        tokens = tokenize_bm25(query)
+        if not tokens or self.doc_count == 0:
+            return {}
+
+        query_terms = Counter(tokens)
+        scores: Dict[str, float] = {}
+        avgdl = self.avgdl or 1.0
+
+        for record_id, tf in self.term_freqs.items():
+            dl = self.doc_len.get(record_id, 0)
+            score = 0.0
+            for term in query_terms.keys():
+                df = self.doc_freq.get(term, 0)
+                if df == 0:
+                    continue
+                idf = math.log(1.0 + (self.doc_count - df + 0.5) / (df + 0.5))
+                freq = tf.get(term, 0)
+                if freq == 0:
+                    continue
+                denom = freq + self.k1 * (1.0 - self.b + self.b * dl / avgdl)
+                score += idf * (freq * (self.k1 + 1.0) / denom)
+
+            if score > 0.0:
+                scores[record_id] = score
+
+        return scores
 
 
 def fuzzy_similarity(text_a: str, text_b: str) -> float:
@@ -598,38 +756,45 @@ def extract_keywords(
     client: Optional[OpenAI],
     model: str,
 ) -> Tuple[List[str], List[str], bool]:
-    prompt = (
-        "你是一個專門處理繁體中文專利常見問答 FAQ 系統的關鍵字提取專家。\n"
-        "你的任務是分析用戶的查詢，並從中提取核心的專利實務概念，以便在專利常見問答資料庫中進行精確的關鍵字比對。\n\n"
-        "## 背景知識：專利基本術語\n"
-        "專利常見問答庫涉及許多專利申請與行政程序的專有名詞。提取關鍵字時，應特別注意以下重要概念與詞彙：\n"
-        "- 審查方案與管道：例如 PPH (專利審查高速公路)、AEP (專利事由加速審查)、TW-SUPA (台美專利合作計畫支援)、一般審查。\n"
-        "- 專利類型：發明專利、新型專利、設計專利。\n"
-        "- 申請主體與關係人：申請人、發明人、代理人、專利代理人、專利師、自然人、法人、本國人、外國人。\n"
-        "- 規費與減免：申請規費、年費、減免、退費、中小企業、自然人減免。\n"
-        "- 代理與委任：委任書、委任代理人、代理人資格。\n"
-        "- 說明書與文件：說明書、申請書、摘要、圖式、外文說明書。\n"
-        "- 審查與程序：實體審查、新型技術報告、補正、申復、答辯、面詢、優先權、侵害、授權、分割、延期、撤銷。\n\n"
-        "## 關鍵字提取規則與定義\n"
-        "1. **Primary Keywords (主要關鍵字)**：\n"
-        "    - 這是指核心的專利術語、類型與程序名稱。例如：發明專利、新型專利、設計專利、規費減免、委任代理人、實體審查、新型技術報告、PPH、AEP、年費、退費。\n"
-        "    - 這些詞通常能直接定位到特定類別 of 常見問題，具有高度的檢索區分度。\n"
-        "2. **Secondary Keywords (次要關鍵字)**：\n"
-        "    - 這是指輔助說明屬性、時間、金額或補充概念。例如：申請程序、期限、外文、幾個月、金額、如何辦理、應檢附文件、身分證明。\n"
-        "    - 用於協助縮小檢索範圍，但不能單獨作為主要檢索字。\n"
-        "3. **過濾無意義的贅字與口語助詞（非常重要，切勿提取）**：\n"
-        "    - **禁止作為關鍵字**：諸如「請問」、「請問一下」、「我想知道」、「有沒有」、「是不是」、「可以嗎」、「需要嗎」、「怎麼辦」、「該如何」、「為什麼」等口語問句或無意義助詞。\n"
-        "4. **專利術語的同義轉換與擴展**：\n"
-        "    - 請自動將用戶口語化的詞彙，對應到正式的專利術語，並加入主要關鍵字中。\n"
-        "      例如：\n"
-        "      - 「加速審查/快速審查」 -> 提取 「AEP」、「PPH」、「加速審查」。\n"
-        "      - 「改名字/換人」 -> 提取 「變更申請人」、「變更發明人」。\n"
-        "      - 「省錢/變便宜」 -> 提取 「規費減免」、「減免」。\n"
-        "      - 「自己辦/不找人辦」 -> 提取 「代理人」、「自辦」。\n"
-        "5. **輸出格式規範**：\n"
-        "    - 每一類關鍵字最多提取 5 個。\n"
-        "    - 請嚴格依照指定的 JSON Schema 格式輸出。\n\n"
-        f"用戶提問：{query}\n"
+    prompt = ("""你是一個專門處理繁體中文專利 FAQ 系統的關鍵字提取專家。
+你的任務是分析用戶查詢，提取核心專利實務概念，以供資料庫進行精確比對。
+
+## 背景知識：專利基本術語
+- 審查方案與管道：PPH (專利審查高速公路)、AEP (專利事由加速審查)、TW-SUPA、一般審查。
+- 專利類型：發明專利、新型專利、設計專利。
+- 申請主體與關係人：申請人、發明人、代理人、專利代理人、專利師、自然人、法人。
+- 規費與程序：申請規費、年費、減免、退費、委任書。
+- 文件與審查：說明書、申請書、摘要、圖式、實體審查、新型技術報告、補正、申復、答辯、面詢、優先權、分割。
+
+## 關鍵字提取規則
+1. Primary Keywords (主要關鍵字)：核心專利術語、類型與程序名稱（如：發明專利、規費減免、實體審查、AEP）。此類別需具備高度檢索區分度。
+2. Secondary Keywords (次要關鍵字)：輔助說明屬性、時間或補充概念（如：期限、外文、金額、應檢附文件）。
+3. 嚴格過濾無意義詞彙：絕對禁止提取「請問、我想知道、有沒有、是不是、可以嗎、怎麼辦、該如何、為什麼、何謂、什麼是」等口語問句或助詞。
+4. 術語正規化 (同義轉換)：將口語詞彙精確對應至正式專利術語。
+   - 「加速審查/快速審查」 -> 提取為「AEP」或「PPH」。
+   - 「改名字/換人」 -> 依據上下文判斷，提取為「變更申請人」、「變更發明人」或「變更代理人」。
+   - 「省錢/變便宜」 -> 提取為「規費減免」。
+
+## 輸出格式規範
+- 每一類關鍵字最多提取 5 個。
+- 僅能輸出純 JSON 格式，嚴禁使用 Markdown 標記（如 ```json）、嚴禁加入任何解釋性文字。
+- 必須嚴格符合以下 JSON 結構：
+{"primary_keywords": ["詞1", "詞2"], "secondary_keywords": ["詞3", "詞4"]}
+
+## 提取範例
+
+【範例 1：定義型問題】
+用戶提問：新型專利具體的法律定義到底是什麼？
+預期輸出：{"primary_keywords": ["新型專利"], "secondary_keywords": ["定義", "法律"]}
+
+【範例 2：時間型問題】
+用戶提問：專利權人可以在什麼時候向智慧局申請專利權更正？
+預期輸出：{"primary_keywords": ["專利權更正"], "secondary_keywords": ["時間", "申請", "何時"]}
+
+【範例 3：口語與術語正規化】
+用戶提問：如果不找人代辦，自己辦理發明專利，規費會不會比較便宜？
+預期輸出：{"primary_keywords": ["發明專利", "規費減免"], "secondary_keywords": ["自辦", "規費"]} """
+        + f"用戶提問：{query}\n"
     )
 
     data = llm_structured(
@@ -673,72 +838,76 @@ def rerank_candidates(
         )
 
     entries_json = json.dumps(entries, ensure_ascii=False)
-    prompt = (
-        "你是一個專業的智慧財產局專利諮詢 Rerank 專家。你的任務是評估用戶提出的查詢與系統檢索出的 FAQ 候選條目之間的相關性分數。\n"
-        "請仔細閱讀用戶的問題 (query) 以及每一個候選條目的問題 (question) 與答案 (answer)。\n\n"
-        "### 評估基準\n"
-        "- question：FAQ 候選條目的問題\n"
-        "- answer：FAQ 候選條目的答案\n\n"
-        "### 評分細則與優先準則\n"
-        "評分時請秉持以下原則：\n"
-        "1. **第一優先：主體與法律概念判定**：評估用戶提問與候選條目的 question 是否存在法律概念上的本質衝突。若主題不符或存在衝突，分數必須低於 40 分。\n"
-        "2. **第二優先：解答實質度判定**：評估候選條目的 answer 是否能實質解答用戶問題的核心實務疑問。\n\n"
-        "## 評分級別說明\n"
-        "- 90-100分 (極度相關)：用戶提問與 FAQ 問題在法律意圖上完全一致，且答案能直接完美解答。\n"
-        "- 80-89分 (高度相關)：用戶問題與 FAQ 問題字面同義改寫，答案提供核心解答，僅有極微細微的描述差異。\n"
-        "- 70-79分 (中度相關)：主題基本相符，但用戶問題包含一些細節在 FAQ 中沒有完全對應，但答案依然有很高的實用參考價值。\n"
-        "- 60-69分 (低度相關)：主題勉強相關，但答案無法直接解答用戶的核心疑問（例如問期限但答案只列出規費）。\n"
-        "- 40-59分 (不相關/衝突)：概念有衝突，例如用戶問發明專利，候選條目是關於新型專利技術報告。此類情況分數必須低於 50 分。\n"
-        "- 0-39分 (完全無關)：完全沒有任何參考價值。\n\n"
-        "## 嚴格扣分與一票否決準則（極重要，必須嚴格遵守）\n"
-        "若遇到以下任一衝突或不符，該條目分數一律不得超過 40 分（直接判定為不相關）：\n"
-        "1. **主體關係人衝突**：例如用戶提問是問「申請人」，但候選條目是關於「發明人」或「代理人」的變更或義務。\n"
-        "2. **專利類型衝突**：例如用戶提問是關於「發明專利」，但候選條目是關於「新型專利」（如技術報告）或「設計專利」。\n"
-        "3. **加速審查方案衝突**：例如用戶提問是問「AEP」，但候選條目是關於「PPH」或「TW-SUPA」等互斥管道。\n\n"
-        "## 評分範例說明\n\n"
-        "### 範例 1：主體關係人衝突一票否決\n"
-        "- 用戶提問：「發明人是不是可以改名字或變更發明人？」\n"
-        "- 候選 FAQ：[問題] 「申請人姓名或名稱變更，應檢附什麼文件？」\n"
-        "- **評估與思考程序 (CoT)**：\n"
-        "  1. 關係人比對：用戶提問的核心是「發明人」的變更，而候選 FAQ 是在回答「申請人」的姓名變更。\n"
-        "  2. 專利實務概念：在專利實務與法律程序中，「發明人」與「申請人」是完全不同的主體，其姓名變更所需的申請書、證明文件與行政程序完全不同！\n"
-        "  3. 衝突判定：這觸發了主體關係人衝突之一票否決（一票否決），因此兩者毫不相關。\n"
-        "  4. 結論：本候選條目完全不適用於發明人變更，評分應給予極低分。\n"
-        "- **評分**：40分\n\n"
-        "### 範例 2：加速審查方案衝突一票否決\n"
-        "- 用戶提問：「我們想申請 AEP，應該怎麼做？」\n"
-        "- 候選 FAQ：[問題] 「申請專利審查高速公路(PPH)應符合什麼條件？」\n"
-        "- **評估與思考程序 (CoT)**：\n"
-        "  1. 方案比對：用戶提問要求申請 AEP (專利事由加速審查)，而候選 FAQ 是介紹 PPH (專利審查高速公路)。\n"
-        "  2. 專利實務概念：AEP 與 PPH 是完全不同且互斥的加速審查管道，其申請事由、檢附文件與規費制度完全不同！\n"
-        "  3. 衝突判定：這觸發了加速方案衝突之一票否決（一票否決），因此兩者完全互斥。\n"
-        "  4. 結論：不能將 PPH 的申請條件套用於 AEP 上，評分給予極低分。\n"
-        "- **評分**：30分\n\n"
-        "### 範例 3：概念完美契合\n"
-        "- 用戶提問：「說明書可以改嗎？」\n"
-        "- 候選 FAQ：[問題] 「專利申請案送件後，說明書或圖式如果有誤，該如何辦理修正？」\n"
-        "- **評估與思考程序 (CoT)**：\n"
-        "  1. 概念比對：用戶詢問「說明書是否可以修改」，而候選 FAQ 解答「送件後說明書或圖式有誤如何辦理修正」。\n"
-        "  2. 專利實務概念：兩者概念完美契合，且 FAQ 答案實質提供了說明書變更（修正）的行政規費與手續。\n"
-        "  3. 衝突判定：無任何主體、類型或方案衝突。\n"
-        "  4. 結論：本條目高度符合用戶需求。\n"
-        "- **評分**：95分\n\n"
-        "### 範例 4：主體與義務不符（高度相關但涉及不同義務）\n"
-        "- 用戶提問：「外國發明人如果想自己辦理專利，可以嗎？」\n"
-        "- 候選 FAQ：[問題] 「外國申請人申請專利是否必須委任代理人辦理？」\n"
-        "- **評估與思考程序 (CoT)**：\n"
-        "  1. 關係人比對：用戶詢問的是「發明人」自己辦理，而候選 FAQ 回答的是「外國申請人」是否必須委任代理人。\n"
-        "  2. 專利實務概念：在台灣專利法中，外國人（在大陸無住所或營業所者）申請專利必須強制委任代理人辦理，發明人自辦與申請人強制委任在主體義務上不完全等同。\n"
-        "  3. 衝突判定：關係人主體有部分不符，且無法直接解答發明人自身的法律權利，因此應予大幅扣分。\n"
-        "  4. 結論：雖有一定參考價值（皆涉及外國人自辦限制），但存在核心概念不對盤，評分不得超過 50 分。\n"
-        "- **評分**：40分\n\n"
-        "## 輸出格式規範\n"
-        "- 必須嚴格針對清單中每個條目的 id 給予對應的相關性評分。\n"
-        "- 必須使用 Markdown 的 JSON 代碼區塊 (code fence) 進行包裝輸出，以防解析出錯。\n"
-        "- 輸出格式必須完全符合提供的 JSON Schema。\n"
+    prompt = ("""你是一個專業的智慧財產局專利諮詢 Rerank 專家。你的任務是評估用戶提出的查詢與系統檢索出的 FAQ 候選條目之間的相關性分數。
+請仔細閱讀用戶的問題 (query) 以及每一個候選條目的問題 (question) 與答案 (answer)。
+
+### 評估基準
+- question：FAQ 候選條目的問題
+- answer：FAQ 候選條目的答案
+
+### 評分細則與優先準則
+評分時請秉持以下原則：
+1. **第一優先：主體與法律概念判定**：評估用戶提問與候選條目的 question 是否存在法律概念或主體上的本質衝突。若主題不符或存在衝突，觸發一票否決，分數必須低於或等於 30 分。
+2. **第二優先：解答實質度判定**：評估候選條目的 answer 是否能實質解答用戶問題的核心實務疑問。
+
+## 評分級別說明
+- 90-100分 (極度相關)：用戶提問與 FAQ 問題在法律意圖上完全一致，且答案能直接完美解答。
+- 80-89分 (高度相關)：用戶問題與 FAQ 問題字面同義改寫，答案提供核心解答，僅有極微細微的描述差異。
+- 70-79分 (中度相關)：主題基本相符，但用戶問題包含一些細節在 FAQ 中沒有完全對應，但答案依然有很高的實用參考價值。
+- 40-69分 (低度相關)：主題勉強相關，但答案無法直接解答用戶的核心疑問（例如問期限但答案只列出規費）。
+- 0-30分 (不相關/衝突/完全無關)：概念有衝突或完全沒有任何參考價值。
+
+## 嚴格一票否決準則（極重要，必須嚴格遵守）
+若遇到以下任一衝突或不符，該條目判定為完全不相關，**分數一律不得超過 30 分**（除特殊焦點衝突另有規定外）：
+1. **主體關係人衝突**：例如用戶提問是問「申請人」，但候選條目是關於「發明人」或「代理人」的變更或義務。
+2. **專利類型衝突**：例如用戶提問是關於「發明專利」，但候選條目是關於「新型專利」（如新型技術報告）或「設計專利」。
+3. **加速審查方案衝突**：例如用戶提問是問「AEP」，但候選條目是關於「PPH」或「TW-SUPA」等互斥管道。
+4. **法定程序與概念衝突**：例如用戶問「更正」，選項是「補換發專利證書」；或者用戶問「延緩實體審查」，選項是「專利權期間延長」。這類在法律上為完全獨立的行政程序，必須嚴格區分。
+5. **提問焦點衝突**：如果用戶問的是「申請的時間點或期限」，但選項是在回答「申請的條件或資格」（或反之），焦點完全不同，視為不相關。
+6. **列舉與比較焦點衝突**：當用戶問的是「種類有哪些 / 有幾種」（列舉型問題，例如：有幾種專利類型），而候選 FAQ 回答的是這些專利的「不同點 / 有何不同」（比較型問題，例如：發明與新型有何不同），或者反之。這兩者雖然關鍵字高度重疊，但提問焦點完全不同，回答後者無法直接解答前者的列舉問題。此情況下，該候選 FAQ 分數一律不得超過 65 分。
+
+## 評分範例說明
+
+### 範例 1：主體關係人衝突一票否決
+- 用戶提問：「發明人是不是可以改名字或變更發明人？」
+- 候選 FAQ：[問題] 「申請人姓名或名稱變更，應檢附什麼文件？」
+- **評估與思考程序 (reasoning)**：用戶提問核心是「發明人」的變更，而候選 FAQ 是回答「申請人」的姓名變更。在專利實務與法律程序中，「發明人」與「申請人」是完全不同的主體，行政程序完全不同。觸發主體關係人衝突之一票否決。
+- **評分 (score)**：30
+
+### 範例 2：加速審查方案衝突一票否決
+- 用戶提問：「我們想申請 AEP，應該怎麼做？」
+- 候選 FAQ：[問題] 「申請專利審查高速公路(PPH)應符合什麼條件？」
+- **評估與思考程序 (reasoning)**：用戶提問要求申請 AEP (專利事由加速審查)，而候選 FAQ 是介紹 PPH (專利審查高速公路)。兩者是完全不同且互斥的加速審查管道。觸發加速方案衝突之一票否決。
+- **評分 (score)**：20
+
+### 範例 3：提問焦點衝突（時間 vs 條件）
+- 用戶提問：「我們可以向 AEP 系統提出申請的時間點是什麼時候？」
+- 候選 FAQ：[問題] 「申請 AEP 應具備什麼條件？」
+- **評估與思考程序 (reasoning)**：用戶問的是申請的「時間點(何時)」，候選 FAQ 回答的是申請的「條件(資格)」。時間與條件是完全不同的實務焦點，回答條件並不能解開用戶對時間的疑問。觸發提問焦點衝突之一票否決。
+- **評分 (score)**：30
+
+### 範例 4：定義涵蓋實務（完美契合）
+- 用戶提問：「專利法所稱的誤譯訂正，這在什麼情況下可以向智慧局申請？」
+- 候選 FAQ：[問題] 「何謂誤譯訂正？」
+- **評估與思考程序 (reasoning)**：用戶詢問「在什麼情況下可以申請」，候選 FAQ 題目是「何謂誤譯訂正」。在官方 FAQ 中，「何謂某程序」的答案通常會完整涵蓋該程序的定義、適用情況與申請時機。無任何衝突，高度契合。
+- **評分 (score)**：95
+
+### 範例 5：列舉與比較焦點衝突
+- 用戶提問：「台灣有哪幾種不同的專利類型？」
+- 候選 FAQ A：[問題] 「我國的專利種類有幾種？」
+  - **評估與思考程序 (reasoning)**：用戶問的是台灣專利的種類有哪些，FAQ A 的問題完全匹配此列舉焦點，且答案能直接給出解答，屬於極度相關。
+  - **評分 (score)**：95
+- 候選 FAQ B：[問題] 「發明、新型及設計專利有何不同？」
+  - **評估與思考程序 (reasoning)**：用戶問的是有哪些種類（列舉型），而 FAQ B 是在比較三種專利的不同點（比較型）。雖然兩者都包含「發明、新型、設計」等關鍵字，但提問焦點不同，FAQ B 無法直接列舉專利種類。屬於中低度相關。
+  - **評分 (score)**：65
+
+## 輸出規範
+- 請直接輸出符合系統定義之 JSON Schema 的結構化資料，嚴禁使用任何 Markdown 標記（如 ```json）。
+- 必須針對清單中每個條目的 id，先在 `reasoning` 欄位寫下評評估程序，再給出 `score`。
+"""
         f"\n用戶提問：{query}\n"
-        f"候選 FAQ 列表 (JSON 格式)：\n{entries_json}\n\n"
-        "評估規則提示：請特別注意第一優先：主體關係人與專利類型判定，若存在衝突（如發明專利與新型專利技術報告混淆、申請人與代理人主體混淆），分數必須低於 40 分。若答覆實質切合，請給予 80 分以上之評分。\n"
+        f"\n候選 FAQ 列表 (JSON 格式)：\n"
+        f"{entries_json}\n"
     )
 
     data = llm_structured(
@@ -746,7 +915,7 @@ def rerank_candidates(
         model,
         prompt,
         RerankOutput,
-        max_output_tokens=1024,
+        max_output_tokens=4096,
         temperature=0.0,
         log_tag="rerank",
     )
@@ -765,26 +934,65 @@ def compute_candidates(
     model: str,
 ) -> Tuple[List[Dict], List[str], List[str]]:
     query_norm = normalize_text(query)
+    global BM25_INDEX
+    bm25_scores: Dict[str, float] = {}
+    bm25_ranks: Dict[str, int] = {}
+    bm25_rank_scores: Dict[str, float] = {}
+    if records:
+        if BM25_INDEX is None or not BM25_INDEX.matches(records):
+            BM25_INDEX = BM25Index(records)
+        bm25_scores = BM25_INDEX.score(query)
+        if bm25_scores:
+            # 只有當 BM25 原始分數顯著大於等於 0.5 時，才列入排名計算，過濾低分噪聲
+            valid_scores = {rid: sc for rid, sc in bm25_scores.items() if sc >= 0.5}
+            if valid_scores:
+                sorted_bm25 = sorted(valid_scores.items(), key=lambda item: item[1], reverse=True)
+                rank_scale = max(len(sorted_bm25) - 1, 1)
+                for rank, (record_id, score) in enumerate(sorted_bm25, start=1):
+                    bm25_ranks[record_id] = rank
+                    bm25_rank_scores[record_id] = 100.0 - (rank - 1) * (100.0 / rank_scale)
     primary_keywords, secondary_keywords, keyword_ready = extract_keywords(query, client, model)
     all_keywords = primary_keywords + secondary_keywords
 
-    # 計算向量檢索相似度
+    # 計算向量檢索相似度 (使用多向量最大相似度設計)
     vector_scores: Dict[str, float] = {}
     if VECTOR_SEARCHER and VECTOR_SEARCHER.embeddings:
         query_vecs = get_embeddings([query], client)
         if query_vecs:
             query_vec_tensor = torch.tensor(query_vecs[0])
             for record in records:
-                if record.record_id in VECTOR_SEARCHER.embeddings:
-                    vec_tensor = torch.tensor(VECTOR_SEARCHER.embeddings[record.record_id])
-                    score = util.cos_sim(query_vec_tensor, vec_tensor).item()
-                    vector_scores[record.record_id] = float(score) * 100.0
+                q_key = f"{record.record_id}_q"
+                s_key = f"{record.record_id}_s"
+                
+                score_q = -1.0
+                score_s = -1.0
+                
+                if q_key in VECTOR_SEARCHER.embeddings:
+                    vec_tensor = torch.tensor(VECTOR_SEARCHER.embeddings[q_key])
+                    score_q = util.cos_sim(query_vec_tensor, vec_tensor).item()
+                    
+                if getattr(record, "synonyms", None) and s_key in VECTOR_SEARCHER.embeddings:
+                    vec_tensor_s = torch.tensor(VECTOR_SEARCHER.embeddings[s_key])
+                    score_s = util.cos_sim(query_vec_tensor, vec_tensor_s).item()
+                    
+                best_score = max(score_q, score_s)
+                vector_scores[record.record_id] = float(best_score) * 100.0
 
     candidates: List[Dict] = []
     for record in records:
         base_text = normalize_text(record.question)
         base_score = fuzzy_similarity(query_norm, base_text)
+        if getattr(record, "synonyms", None):
+            # 對於延伸同義問題，計算 query 與每個同義句的 fuzzy ratio，取最大值以防止短題目被嚴重壓分
+            synonym_list = [s.strip() for s in record.synonyms.split("；") if s.strip()]
+            for syn in synonym_list:
+                syn_score = fuzzy_similarity(query_norm, normalize_text(syn))
+                if syn_score > base_score:
+                    base_score = syn_score
         vec_score = vector_scores.get(record.record_id, 0.0)
+        bm25_score = bm25_scores.get(record.record_id, 0.0)
+        bm25_rank = bm25_ranks.get(record.record_id)
+        bm25_rank_score = bm25_rank_scores.get(record.record_id, 0.0)
 
         # 長度與字元重疊補償 (Length & Character Overlap Compensation)
         # 對於較短的 FAQ 題目（例如字數 <= 6），若字元重疊比例 >= 50%，則給予適當的相似度補償。
@@ -803,26 +1011,35 @@ def compute_candidates(
             primary_score = keyword_similarity(primary_keywords, record.search_text)
             secondary_score = keyword_similarity(secondary_keywords, record.search_text)
             hit_count = keyword_hit_count(all_keywords, record.search_text)
+            
+            # 主要關鍵字在題目中的精確命中次數加成 (Primary Keyword Exact Hits Boost)
+            primary_exact_hits = sum(1 for kw in primary_keywords if kw and kw in record.question)
+            
             # 計算綜合檢索評分
             total_score = (
                 0.25 * base_score
                 + 0.45 * vec_score
-                + 0.10 * primary_score
-                + 0.20 * secondary_score
+                + 0.25 * primary_score
+                + 0.05 * secondary_score
+                + 0.12 * bm25_rank_score
                 + hit_count
+                + (primary_exact_hits * 3.0)
                 + length_compensation
             )
         else:
             primary_score = None
             secondary_score = None
             hit_count = None
-            total_score = 0.30 * base_score + 0.70 * vec_score + length_compensation
+            total_score = 0.30 * base_score + 0.70 * vec_score + 0.15 * bm25_rank_score + length_compensation
 
         candidates.append(
             {
                 "record": record,
                 "base_score": base_score,
                 "vector_score": vec_score,
+                "bm25_score": bm25_score,
+                "bm25_rank": bm25_rank,
+                "bm25_rank_score": bm25_rank_score,
                 "primary_score": primary_score,
                 "secondary_score": secondary_score,
                 "hit_count": hit_count,
@@ -946,7 +1163,7 @@ def answer_query(
     # 說明：低置信度閾值 (60.0) 是結合檢索相似度與 LLM 評估分數的綜合評定基準。
     # 若綜合評分低於此值，則代表檢索結果不夠精確，系統將啟動 RAG 或通用知識回答機制。
     low_confidence_threshold = 60.0
-    top_k = 8
+    top_k = 12
     score_gap_threshold = 8.0
 
     # 初始化除錯輸出參數
@@ -1026,20 +1243,34 @@ def answer_query(
         exact_match = bool(query_norm and top_question_norm and query_norm == top_question_norm)
         fuzzy_match = False
         if not exact_match and query_norm and top_question_norm:
-            fuzzy_match = fuzzy_similarity(query_norm, top_question_norm) >= 85.0
+            fuzzy_match = fuzzy_similarity(query_norm, top_question_norm) >= 88.0
 
         # 定義語意匹配 (Semantic Match) 的高置信度判定基準
-        # 使用 text-embedding-bge-m3 模型時，若檢索向量分數 >= 88.0 且與第二名的差距足夠大，則視為語意匹配。
+        # 使用 text-embedding-bge-m3 模型時，若檢索向量分數 >= 85.0 且與第二名的差距足夠大，則視為語意匹配。
         semantic_match = False
         if not exact_match and not fuzzy_match:
             if top_candidate["vector_score"] >= 88.0 and score_gap_ok:
                 semantic_match = True
 
-        # 如果滿足精確匹配、模糊匹配或高置信度語意匹配，且無術語衝突，則直接鎖定該結果。
-        # 這樣可以避免進入耗時的 LLM Reranker，加速常見問答的響應。
+        bm25_match = False
+        bm25_gap_ok = False
+        bm25_rank = top_candidate.get("bm25_rank")
+        bm25_top = top_candidate.get("bm25_score", 0.0)
+        bm25_second = candidates[1].get("bm25_score", 0.0) if len(candidates) > 1 else None
+        if bm25_rank == 1 and bm25_top >= 1.5:
+            if bm25_second is None:
+                bm25_gap_ok = True
+            else:
+                bm25_gap_ok = bm25_top >= (bm25_second + 0.001) * 1.5
+            if bm25_gap_ok:
+                bm25_match = True
+
         has_conflict = check_conflict(query, top_candidate["record"].question)
 
-        if not has_conflict and (score_gap_ok and (exact_match or fuzzy_match or semantic_match)):
+        # 優化快速鎖定防禦網，若第二名分數 >= 75.0 (雙峰警戒水位)，不允許語意/詞頻 bypass，強制送 Reranker
+        if not has_conflict and (score_gap_ok and (exact_match or fuzzy_match or 
+            (semantic_match and (second_score is None or second_score < 75.0)) or 
+            (bm25_match and (second_score is None or second_score < 75.0)))):
             for item in candidates:
                 item["final_score"] = item["total_score"]
 
@@ -1113,7 +1344,7 @@ def answer_query(
                 ret_diff = ret_top1_score - ret_selected_score
 
                 if ret_diff >= 3.0:
-                    # �� LLM 頞羓��訾葉鈭�炎蝝Ｚ�撌桃��賊�嚗峕�撌桅�嚗ǐet_diff嚗厰�脰�銵唳�嚗屸俈甇� LLM 敺桀��誩末蝧餌𥿢
+                    # 依據 LLM 評估差距與檢索差距進行 Damping 計算
                     damping = 2.0 + min(llm_gap * 0.6, 12.0) + (ret_diff - 3.0) * 0.8
                 elif ret_diff < 1.5:
                     damping = 0.0
@@ -1150,10 +1381,10 @@ def answer_query(
     best = candidates[0]
 
     # 覆蓋度判定優化 (Coverage Bypass)：
-    # 若最佳候選條目的向量檢索分數極高 (>= 90.0) 且與次佳候選的差距足夠，且無術語衝突，
+    # 若最佳候選條目的向量檢索分數很高 (>= 85.0)，或 >= 80.0 且與次佳候選的差距足夠，且無術語衝突，
     # 則直接將 has_coverage 設為 True，避免呼叫 LLM 進行 check_coverage()，以提升效能並減少 API 開銷。
     best_has_conflict = check_conflict(query, best["record"].question)
-    if best["vector_score"] >= 90.0 and score_gap_ok and not best_has_conflict:
+    if best["vector_score"] >= 88.0 or (best["vector_score"] >= 88.0 and score_gap_ok and not best_has_conflict):
         has_coverage_val = True
         logging.info(
             "[Coverage Bypass] High confidence vector score (%.2f) and gap ok. Bypassing check_coverage.",
@@ -1321,7 +1552,7 @@ def answer_query(
         "low_confidence": low_confidence,
         "response_type": "standard",
         "retrieval_score": round(retrieval_score, 2),
-        "retrieval_rank": retrieval_score,
+        "retrieval_rank": retrieval_rank,
         "llm_score": round(llm_score, 2) if isinstance(llm_score, (int, float)) else llm_score,
         "llm_rank": llm_rank,
         "final_score": round(best["final_score"], 2),
@@ -1376,12 +1607,13 @@ LINE_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
 
 # LMStudio settings
 LMSTUDIO_BASE_URL = "http://localhost:1234/v1"
-LLM_MODEL = "google/gemma-4-e4b"
+LLM_MODEL = "qwen3.5-4b"
 LLM_CLIENT = OpenAI(base_url=LMSTUDIO_BASE_URL)
 logging.info("Using LM Studio OpenAI SDK at %s with model %s", LMSTUDIO_BASE_URL, LLM_MODEL)
 
 FAQ_RECORDS = load_faq("db.csv")
 VECTOR_SEARCHER = VectorSearcher(FAQ_RECORDS, LLM_CLIENT)
+BM25_INDEX = BM25Index(FAQ_RECORDS) if FAQ_RECORDS else None
 
 
 @app.route("/", methods=["GET"])
@@ -1416,8 +1648,6 @@ def api_faq_random():
     import random
     try:
         limit = int(request.args.get("limit", 4))
-    except ValueError:
-        limit = 4
     except ValueError:
         limit = 4
         
