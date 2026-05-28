@@ -66,34 +66,28 @@ function addMessage(text, role, isLoading = false, data = null) {
   const message = document.createElement("div");
   message.className = `message ${role}${isLoading ? " loading" : ""}`;
   
-  // 建立純文字節點以避免 HTML 注入
   const textNode = document.createElement("div");
-  textNode.style.whiteSpace = "pre-wrap";
-  textNode.textContent = text;
-  message.appendChild(textNode);
-
-  // 渲染出處標籤按鈕
-  if (data && role === "bot") {
-    const hasStandardId = data.response_type === "standard" && data.record_id;
-    const hasRagIds = data.response_type === "rag" && data.reference_ids && data.reference_ids.length > 0;
+  
+  if (role === "bot" && !isLoading) {
+    textNode.className = "markdown-body";
+    // 1. 將 [#ID] 替換為行內按鈕
+    let processedText = text.replace(/\[#(\w+)\]/g, (match, id) => {
+      return ` <button class="inline-citation" data-id="${id}" title="查看出處 (項次 ${id})">${id}</button> `;
+    });
     
-    if (hasStandardId || hasRagIds) {
-      const sourcesContainer = document.createElement("div");
-      sourcesContainer.className = "sources-container";
-      
-      if (hasStandardId) {
-        const btn = createSourceButton(data.record_id);
-        sourcesContainer.appendChild(btn);
-      } else if (hasRagIds) {
-        data.reference_ids.forEach(id => {
-          const btn = createSourceButton(id);
-          sourcesContainer.appendChild(btn);
-        });
-      }
-      message.appendChild(sourcesContainer);
-    }
+    // 2. 解析 Markdown
+    const rawHtml = marked.parse(processedText);
+    
+    // 3. 安全過濾，允許我們自訂的 data-id 屬性
+    const sanitizedHtml = DOMPurify.sanitize(rawHtml, { ADD_ATTR: ['data-id'] });
+    textNode.innerHTML = sanitizedHtml;
+  } else {
+    // 使用者訊息或載入中動畫，使用純文字以策安全
+    textNode.style.whiteSpace = "pre-wrap";
+    textNode.textContent = text;
   }
-
+  
+  message.appendChild(textNode);
   chatLog.appendChild(message);
 
   // 觸發淡入動畫
@@ -110,31 +104,18 @@ function addMessage(text, role, isLoading = false, data = null) {
   return message;
 }
 
-/**
- * Creates a premium citation button with a search book SVG icon.
- * @param {string} id FAQ record_id 
- */
-function createSourceButton(id) {
-  const btn = document.createElement("button");
-  btn.className = "source-tag";
-  btn.type = "button";
-  btn.dataset.id = id;
-  
-  // SVG 書本圖案，象徵引用文獻
-  btn.innerHTML = `
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
-      <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path>
-    </svg>
-    <span>出處：項次 ${id}</span>
-  `;
-  
-  btn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    openFaqModal(id);
-  });
-  return btn;
-}
+// 綁定行內標籤點擊事件 (Event Delegation)
+chatLog.addEventListener("click", (e) => {
+  const btn = e.target.closest(".inline-citation");
+  if (btn) {
+    const id = btn.dataset.id;
+    if (id) {
+      openFaqModal(id);
+    }
+  }
+});
+
+
 
 function scrollToBottom() {
   chatLog.scrollTo({

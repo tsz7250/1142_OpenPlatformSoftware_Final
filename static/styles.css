@@ -1520,3 +1520,71 @@ body {
 .icon-refresh.spinning {
   animation: spin 0.8s cubic-bezier(0.4, 0, 0.2, 1);
 }
+
+/* ==========================================================================
+   Markdown 與行內出處標籤樣式 (NotebookLM 風格)
+   ========================================================================== */
+.markdown-body {
+  font-size: 1.02rem;
+  line-height: 1.65;
+  white-space: normal !important; /* 覆寫 .message.bot 的 pre-wrap，防止 marked.js 的換行變成真實空白 */
+}
+
+.markdown-body p {
+  margin-bottom: 0.6em;
+}
+
+.markdown-body p:last-child {
+  margin-bottom: 0;
+}
+
+.markdown-body ul, .markdown-body ol {
+  margin-bottom: 0.6em;
+  padding-left: 1.5em;
+}
+
+.markdown-body li {
+  margin-bottom: 0.3em;
+}
+
+.markdown-body li:last-child {
+  margin-bottom: 0;
+}
+
+/* 消除巢狀清單疊加的底邊距 */
+.markdown-body li > ul, 
+.markdown-body li > ol {
+  margin-bottom: 0;
+  margin-top: 0.3em;
+}
+
+.markdown-body strong {
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.inline-citation {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--accent-light);
+  color: var(--accent);
+  font-size: 0.75rem;
+  font-weight: 700;
+  vertical-align: super;
+  margin-left: 2px;
+  cursor: pointer;
+  border: 1px solid var(--ring);
+  transition: all 0.2s ease;
+  text-decoration: none;
+}
+
+.inline-citation:hover {
+  background: var(--accent);
+  color: #ffffff;
+  transform: translateY(-1px);
+  box-shadow: 0 2px 6px rgba(15, 139, 141, 0.3);
+}
