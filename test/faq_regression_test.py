@@ -3,6 +3,8 @@ import os
 import re
 import sys
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Ensure script and parent directory are on sys.path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -13,6 +15,7 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 import app
+import engine
 
 REPORT_COLUMNS = [
     "index",
@@ -35,13 +38,16 @@ REPORT_COLUMNS = [
     "exact_match",
     "fuzzy_match",
     "semantic_match",
+    "bm25_match",
     "score_gap_ok",
-    "has_conflict",
     "primary_keywords",
     "secondary_keywords",
     "top2_question",
     "top2_score",
+    "is_aligned",
     "has_coverage",
+    "alignment_reason",
+    "coverage_reason",
     "expected_retrieval_score",
     "expected_retrieval_rank",
     "expected_llm_score",
@@ -68,9 +74,19 @@ def normalize_text(text: str) -> str:
 
 def is_row_mismatch(row) -> bool:
     error = row.get("error", "")
+    if error:
+        return True
+        
+    expected_id = str(row.get("record_id", "")).strip()
+    matched_id = str(row.get("matched_id", "")).strip()
+    
+    # 若檢索系統最終定位的 ID 就是預期的 ID (即使是 RAG 產生不同字串)，則視為正確
+    if matched_id and expected_id and matched_id == expected_id:
+        return False
+        
     expected_norm = normalize_text(row.get("expected_answer", ""))
     actual_norm = normalize_text(row.get("actual_answer", ""))
-    return bool(error or expected_norm != actual_norm)
+    return bool(expected_norm != actual_norm)
 
 
 def ensure_parent_dir(path: str) -> None:
@@ -84,42 +100,118 @@ def run_single_stage_test(args, records, questions_map, client, model):
     total_tasks = len(records)
     results = []
     completed = 0
-    for index, record in enumerate(records):
-        query_text = questions_map.get(record.record_id, "")
-        display_query = query_text if query_text else record.question
-        print(f"[{index + 1}/{total_tasks}] User asking: \"{display_query}\"")
-        
-        result = run_one(
-            index,
-            record,
-            query_text,
-            records,
-            client,
-            model,
-        )
-        results.append(result)
-        completed += 1
-        
-        # Check for error in result to provide immediate feedback
-        if result.get("error"):
-            print(f"  [ERROR] {result['error']}")
-            print(f"         +- 測試結果: 錯誤 (Error)")
-        else:
-            resp_type = result.get("response_type", "standard")
-            ret_score = result.get("retrieval_score", "N/A")
-            ret_rank = result.get("retrieval_rank", "N/A")
-            llm_score = result.get("llm_score", "N/A")
-            llm_rank = result.get("llm_rank", "N/A")
-            fin_score = result.get("final_score", "N/A")
-            print(f"  [DONE] Answer received (Type: {resp_type})")
-            print(f"         | - Retrieval Score: {ret_score} (Rank: {ret_rank})")
-            print(f"         | - LLM Rerank Score: {llm_score} (Rank: {llm_rank})")
-            print(f"         | - Final Score: {fin_score}")
-            status_str = "錯誤 (Mismatch)" if is_row_mismatch(result) else "正確 (Pass)"
-            print(f"         +- 測試結果: {status_str}")
+    concurrency = getattr(args, "concurrency", 1)
 
-        if completed % 10 == 0 or completed == total_tasks:
-            print(f"--- Progress: {completed}/{total_tasks} ---")
+    if concurrency > 1:
+        # Pre-initialize CrossEncoder in the main thread to avoid concurrent lazy-loading race conditions.
+        if engine.CROSS_ENCODER is None:
+            from sentence_transformers import CrossEncoder
+            try:
+                print("Initializing CrossEncoder in main thread before starting parallel pool...")
+                engine.CROSS_ENCODER = CrossEncoder("BAAI/bge-reranker-v2-m3", max_length=1024)
+            except Exception as e:
+                print(f"Failed to pre-initialize CrossEncoder: {e}")
+
+        results_map = {}
+        print_lock = threading.Lock()
+        completed_lock = threading.Lock()
+
+        def worker(index, record):
+            nonlocal completed
+            query_text = questions_map.get(record.record_id, "")
+            result = run_one(
+                index,
+                record,
+                query_text,
+                records,
+                client,
+                model,
+            )
+
+            # Prepare log block
+            display_query = query_text if query_text else record.question
+            lines = [f"[{index + 1}/{total_tasks}] User asking: \"{display_query}\""]
+
+            if result.get("error"):
+                lines.append(f"  [ERROR] {result['error']}")
+                lines.append(f"         +- 測試結果: 錯誤 (Error)")
+            else:
+                resp_type = result.get("response_type", "standard")
+                ret_score = result.get("retrieval_score", "N/A")
+                ret_rank = result.get("retrieval_rank", "N/A")
+                llm_score = result.get("llm_score", "N/A")
+                llm_rank = result.get("llm_rank", "N/A")
+                fin_score = result.get("final_score", "N/A")
+                lines.append(f"  [DONE] Answer received (Type: {resp_type})")
+                lines.append(f"         | - Retrieval Score: {ret_score} (Rank: {ret_rank})")
+                lines.append(f"         | - LLM Rerank Score: {llm_score} (Rank: {llm_rank})")
+                lines.append(f"         | - Final Score: {fin_score}")
+                status_str = "錯誤 (Mismatch)" if is_row_mismatch(result) else "正確 (Pass)"
+                lines.append(f"         +- 測試結果: {status_str}")
+
+            with completed_lock:
+                completed += 1
+                curr_completed = completed
+
+            if curr_completed % 10 == 0 or curr_completed == total_tasks:
+                lines.append(f"--- Progress: {curr_completed}/{total_tasks} ---")
+
+            # Print atomically to prevent stdout interleaved outputs
+            with print_lock:
+                print("\n".join(lines))
+
+            return index, result
+
+        # Use ThreadPoolExecutor for concurrent execution
+        print(f"Starting test runner with concurrency = {concurrency}...")
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [executor.submit(worker, idx, rec) for idx, rec in enumerate(records)]
+            for future in as_completed(futures):
+                try:
+                    idx, result = future.result()
+                    results_map[idx] = result
+                except Exception as exc:
+                    print(f"Thread execution failed: {exc}")
+
+        # Reconstruct ordered results
+        results = [results_map[i] for i in range(total_tasks) if i in results_map]
+    else:
+        for index, record in enumerate(records):
+            query_text = questions_map.get(record.record_id, "")
+            display_query = query_text if query_text else record.question
+            print(f"[{index + 1}/{total_tasks}] User asking: \"{display_query}\"")
+
+            result = run_one(
+                index,
+                record,
+                query_text,
+                records,
+                client,
+                model,
+            )
+            results.append(result)
+            completed += 1
+
+            # Check for error in result to provide immediate feedback
+            if result.get("error"):
+                print(f"  [ERROR] {result['error']}")
+                print(f"         +- 測試結果: 錯誤 (Error)")
+            else:
+                resp_type = result.get("response_type", "standard")
+                ret_score = result.get("retrieval_score", "N/A")
+                ret_rank = result.get("retrieval_rank", "N/A")
+                llm_score = result.get("llm_score", "N/A")
+                llm_rank = result.get("llm_rank", "N/A")
+                fin_score = result.get("final_score", "N/A")
+                print(f"  [DONE] Answer received (Type: {resp_type})")
+                print(f"         | - Retrieval Score: {ret_score} (Rank: {ret_rank})")
+                print(f"         | - LLM Rerank Score: {llm_score} (Rank: {llm_rank})")
+                print(f"         | - Final Score: {fin_score}")
+                status_str = "錯誤 (Mismatch)" if is_row_mismatch(result) else "正確 (Pass)"
+                print(f"         +- 測試結果: {status_str}")
+
+            if completed % 10 == 0 or completed == total_tasks:
+                print(f"--- Progress: {completed}/{total_tasks} ---")
 
     # 排序：錯誤的排在最前，正確的在後，各自照 index 排序
     sorted_results = sorted(results, key=lambda row: (0 if is_row_mismatch(row) else 1, row["index"]))
@@ -157,7 +249,7 @@ def run_one(index, record, query_text, records, client, model):
         query = query_text or record.question
         # Use ALL_RECORDS as the search database to ensure full coverage
         search_db = ALL_RECORDS if ALL_RECORDS else records
-        result = app.answer_query(query, search_db, client, model)
+        result = engine.answer_query(query, search_db, client, model)
         
         # 預期條目的對比分數預設值
         expected_ret_score = "N/A"
@@ -217,6 +309,7 @@ def run_one(index, record, query_text, records, client, model):
         return {
             "index": index,
             "record_id": record.record_id,
+            "matched_id": matched_id,
             "問題": query,
             "原本的問題": record.question,
             "預期答案": record.answer,
@@ -239,13 +332,16 @@ def run_one(index, record, query_text, records, client, model):
             "exact_match": result.get("exact_match", "N/A"),
             "fuzzy_match": result.get("fuzzy_match", "N/A"),
             "semantic_match": result.get("semantic_match", "N/A"),
+            "bm25_match": result.get("bm25_match", "N/A"),
             "score_gap_ok": result.get("score_gap_ok", "N/A"),
-            "has_conflict": result.get("has_conflict", "N/A"),
             "primary_keywords": result.get("primary_keywords", "N/A"),
             "secondary_keywords": result.get("secondary_keywords", "N/A"),
             "top2_question": result.get("top2_question", "N/A"),
             "top2_score": result.get("top2_score", "N/A"),
+            "is_aligned": result.get("is_aligned", "N/A"),
             "has_coverage": result.get("has_coverage", "N/A"),
+            "alignment_reason": result.get("alignment_reason", "N/A"),
+            "coverage_reason": result.get("coverage_reason", "N/A"),
             # 新增預期對照欄位
             "expected_retrieval_score": expected_ret_score,
             "expected_retrieval_rank": expected_ret_rank,
@@ -259,6 +355,7 @@ def run_one(index, record, query_text, records, client, model):
         return {
             "index": index,
             "record_id": record.record_id,
+            "matched_id": "",
             "問題": query_text or record.question,
             "原本的問題": record.question,
             "預期答案": record.answer,
@@ -280,13 +377,16 @@ def run_one(index, record, query_text, records, client, model):
             "exact_match": "N/A",
             "fuzzy_match": "N/A",
             "semantic_match": "N/A",
+            "bm25_match": "N/A",
             "score_gap_ok": "N/A",
-            "has_conflict": "N/A",
             "primary_keywords": "N/A",
             "secondary_keywords": "N/A",
             "top2_question": "N/A",
             "top2_score": "N/A",
+            "is_aligned": "N/A",
             "has_coverage": "N/A",
+            "alignment_reason": "N/A",
+            "coverage_reason": "N/A",
             "expected_retrieval_score": "N/A",
             "expected_retrieval_rank": "N/A",
             "expected_llm_score": "N/A",
@@ -330,13 +430,13 @@ def main() -> int:
 
     args = Args()
 
-    ALL_RECORDS = app.load_faq(args.csv)
+    ALL_RECORDS = engine.load_faq(args.csv)
     if not ALL_RECORDS:
         print("No records loaded from CSV.")
         return 1
 
     # Disable debug CSV to avoid concurrent writes.
-    app.DEBUG_CSV_PATH = ""
+    engine.DEBUG_CSV_PATH = ""
 
     # Optional: load alternate question CSV (merged human paraphrases).
     def load_questions(csv_path: str):

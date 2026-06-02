@@ -125,6 +125,36 @@ class CoverageOutput(BaseModel):
     coverage_gap: str
 
 
+class ContextualizeOutput(BaseModel):
+    standalone_query: str
+
+def contextualize_query(query: str, history: List[Dict[str, str]], client: Optional[OpenAI], model: str) -> str:
+    if not client or not history:
+        return query
+    
+    chat_history_str = "\n".join([f"{msg['role'].capitalize()}: {msg['content']}" for msg in history])
+    
+    system_instruction = """你是一個對話重寫助手。
+任務：根據給定的對話歷史（Context）和使用者剛輸入的最新問題（Follow-up Input），將最新問題重寫為一個「獨立、完整且不依賴上下文就能理解」的問題。
+
+限制：
+- 不要回答該問題，只需要重寫問題。
+- 如果最新問題本身已經很完整，不需要上下文即可理解，則逐字保留原問題。
+- 保持問題原本的意圖與語言。"""
+
+    user_prompt = f"對話歷史：\n{chat_history_str}\n\n最新問題：{query}\n\n獨立問題："
+    
+    res = llm_structured(
+        client, model, user_prompt, ContextualizeOutput,
+        system_instruction=system_instruction,
+        max_output_tokens=128, temperature=0.0, log_tag="contextualize"
+    )
+    if res and res.standalone_query:
+        logging.info("Contextualized Query: '%s' -> '%s'", query, res.standalone_query)
+        return res.standalone_query
+    return query
+
+
 def normalize_text(text: str) -> str:
     text = text or ""
     text = text.strip().lower()
@@ -540,7 +570,7 @@ def synthesize_answer_from_vector(
 
 
 class VectorSearcher:
-    def __init__(self, records: List[FaqRecord], client: Optional[OpenAI], cache_path: str = "faq_embeddings_qonly.json"):
+    def __init__(self, records: List[FaqRecord], client: Optional[OpenAI], cache_path: str = "faq_embeddings_contextual.json"):
         self.records = records
         self.client = client
         self.cache_path = cache_path
@@ -590,10 +620,10 @@ class VectorSearcher:
         texts_to_embed = []
         for r in self.records:
             keys_to_embed.append(f"{r.record_id}_q")
-            texts_to_embed.append(r.question)
+            texts_to_embed.append(f"[{r.category}] {r.question}")
             if getattr(r, "synonyms", None):
                 keys_to_embed.append(f"{r.record_id}_s")
-                texts_to_embed.append(r.synonyms)
+                texts_to_embed.append(f"[{r.category}] {r.synonyms}")
 
         all_values = get_embeddings(texts_to_embed, self.client)
 
@@ -705,9 +735,9 @@ class BM25Index:
         total_len = 0
         for record in self.records:
             # 合併題目與延伸問題以建立更健壯的 BM25 詞彙索引
-            text_to_tokenize = record.question
+            text_to_tokenize = f"[{record.category}] {record.question}"
             if getattr(record, "synonyms", None):
-                text_to_tokenize = f"{record.question} {record.synonyms}"
+                text_to_tokenize = f"[{record.category}] {record.question} {record.synonyms}"
             tokens = tokenize_bm25(text_to_tokenize)
             freq = Counter(tokens)
             self.term_freqs[record.record_id] = freq
@@ -933,6 +963,7 @@ def compute_candidates(
 
     # 計算向量檢索相似度 (使用多向量最大相似度設計)
     vector_scores: Dict[str, float] = {}
+    vector_ranks: Dict[str, int] = {}
     if VECTOR_SEARCHER and VECTOR_SEARCHER.embeddings:
         query_vecs = get_embeddings([query], client)
         if query_vecs:
@@ -954,6 +985,11 @@ def compute_candidates(
                     
                 best_score = max(score_q, score_s)
                 vector_scores[record.record_id] = float(best_score) * 100.0
+                
+            if vector_scores:
+                sorted_vec = sorted(vector_scores.items(), key=lambda item: item[1], reverse=True)
+                for rank, (record_id, score) in enumerate(sorted_vec, start=1):
+                    vector_ranks[record_id] = rank
 
     candidates: List[Dict] = []
     for record in records:
@@ -967,9 +1003,15 @@ def compute_candidates(
                 if syn_score > base_score:
                     base_score = syn_score
         vec_score = vector_scores.get(record.record_id, 0.0)
+        vec_rank = vector_ranks.get(record.record_id, 1000)
         bm25_score = bm25_scores.get(record.record_id, 0.0)
-        bm25_rank = bm25_ranks.get(record.record_id)
+        bm25_rank = bm25_ranks.get(record.record_id, 1000)
         bm25_rank_score = bm25_rank_scores.get(record.record_id, 0.0)
+        
+        rrf_score = 0.0
+        if vec_score > 0 or bm25_score > 0:
+            rrf_score = (1.0 / (60.0 + vec_rank)) + (1.0 / (60.0 + bm25_rank))
+        rrf_normalized = (rrf_score / 0.03278688) * 100.0
 
         # 長度與字元重疊補償 (Length & Character Overlap Compensation)
         # 較短的 FAQ 題目在口語改寫後容易被更長的相關 FAQ 壓過，給予漸進式補償。
@@ -1004,13 +1046,16 @@ def compute_candidates(
                 if kw and kw not in record.question and kw in record.answer
             ) * 1.5
             
-            # 計算綜合檢索評分
+            # 計算綜合檢索評分 (RRF + Heuristics)
+            # 註：額外加上 0.10 * bm25_rank_score 是為了補償 RRF 非線性倒數排名 (1/(60+rank)) 抹平前幾名分數差距的副作用，
+            # 保障當專利關鍵字「字面精確命中 (Exact Match)」時，BM25 絕對第一名的線性分數優勢能被保留，防止被語意擦邊球壓過。
             total_score = (
-                0.25 * base_score
+                0.20 * rrf_normalized
                 + 0.50 * vec_score
+                + 0.25 * base_score
+                + 0.10 * bm25_rank_score
                 + 0.25 * primary_score
                 + 0.05 * secondary_score
-                + 0.12 * bm25_rank_score
                 + hit_count
                 + (primary_exact_hits * 3.0)
                 + answer_hit_bonus
@@ -1021,7 +1066,8 @@ def compute_candidates(
             secondary_score = None
             hit_count = None
             answer_hit_bonus = 0.0
-            total_score = 0.25 * base_score + 0.75 * vec_score + 0.15 * bm25_rank_score + length_compensation
+            # 額外加上 0.10 * bm25_rank_score 以補償 RRF 抹平前幾名名次差距的副作用，保留字面精準命中的線性優勢
+            total_score = 0.20 * rrf_normalized + 0.50 * vec_score + 0.25 * base_score + 0.10 * bm25_rank_score + length_compensation
 
         candidates.append(
             {

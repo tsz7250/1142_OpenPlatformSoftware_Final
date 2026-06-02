@@ -14,28 +14,59 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 import app
+import engine
 import faq_regression_test as frt
 
-CONFIGS = [
+BASE_CONFIGS = [
     # {
     #     "csv": "db.csv",
+    #     "model": "qwen3.5-4b",
     #     "report": "test/reports/original_faq_mismatch.csv",
     #     "questions_csv": "",
     #     "test_only_mismatches": False,
+    #     "concurrency": 1,
     # },
-    {
+    # {
+    #     "csv": "db.csv",
+    #     "model": "qwen3.5-4b",
+    #     "report": "test/reports/repara_faq_mismatch.csv",
+    #     "questions_csv": "test/questions_reparaphrased.csv",
+    #     "test_only_mismatches": False,
+    #     "concurrency": 1,
+    # },
+    # {
+    #     "csv": "db.csv",
+    #     "model": "qwen3.5-4b",
+    #     "report": "test/reports/repara_faq_mismatch_1.csv",
+    #     "questions_csv": "test/questions_reparaphrased_1.csv",
+    #     "test_only_mismatches": False,
+    #     "concurrency": 1,
+    # },
+    # {
+    #     "csv": "db.csv",
+    #     "model": "qwen3.5-4b",
+    #     "report": "test/reports/original_faq_mismatch.csv",
+    #     "questions_csv": "test/reports/original_faq_mismatch.csv",
+    #     "test_only_mismatches": True,
+    # },
+    { 
         "csv": "db.csv",
-        "report": "test/reports/repara_faq_mismatch_retry.csv",
+        "model": "qwen3.5-4b",
+        "report": "test/reports/repara_faq_mismatch.csv",
         "questions_csv": "test/reports/repara_faq_mismatch.csv",
         "test_only_mismatches": True,
     },
     {
         "csv": "db.csv",
-        "report": "test/reports/repara_faq_mismatch_1_retry.csv",
+        "model": "qwen3.5-4b",
+        "report": "test/reports/repara_faq_mismatch_1.csv",
         "questions_csv": "test/reports/repara_faq_mismatch_1.csv",
         "test_only_mismatches": True,
     }
 ]
+
+
+CONFIGS = [dict(base) for base in BASE_CONFIGS]
 
 
 def run_config(index, cfg):
@@ -45,6 +76,8 @@ def run_config(index, cfg):
         print(f"  {k} = {v!r}")
     print("=" * 70 + "\n")
 
+    app.LLM_MODEL = cfg.get("model", app.LLM_MODEL)
+
     class Args:
         pass
 
@@ -52,12 +85,12 @@ def run_config(index, cfg):
     for k, v in cfg.items():
         setattr(args, k, v)
 
-    frt.ALL_RECORDS = app.load_faq(args.csv)
+    frt.ALL_RECORDS = engine.load_faq(args.csv)
     if not frt.ALL_RECORDS:
         print("No records loaded from CSV.")
         return 1
 
-    app.DEBUG_CSV_PATH = ""
+    engine.DEBUG_CSV_PATH = ""
 
     def load_questions(csv_path: str):
         import csv as csv_mod

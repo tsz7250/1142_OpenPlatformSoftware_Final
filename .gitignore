@@ -67,3 +67,5 @@ Thumbs.db
 # Project specific ignores
 *debug_candidates.csv
 test/reports/
+sessions.db
+faq_embeddings_*.json

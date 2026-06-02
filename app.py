@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import random
+import sqlite3
 from typing import Dict, List, Optional, Tuple, Union
 
 import requests
@@ -76,6 +77,133 @@ engine.FAQ_RECORDS = engine.load_faq("db.csv")
 engine.VECTOR_SEARCHER = engine.VectorSearcher(engine.FAQ_RECORDS, LLM_CLIENT)
 engine.BM25_INDEX = engine.BM25Index(engine.FAQ_RECORDS) if engine.FAQ_RECORDS else None
 
+DB_PATH = "sessions.db"
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT, 
+                role TEXT, 
+                content TEXT, 
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS semantic_cache (
+                query_hash TEXT PRIMARY KEY, 
+                query TEXT, 
+                embedding JSON, 
+                response JSON, 
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+
+init_db()
+
+def get_session_history(session_id: str) -> List[Dict[str, str]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT role, content FROM sessions 
+            WHERE session_id = ? 
+            ORDER BY timestamp DESC LIMIT 10
+        ''', (session_id,))
+        rows = cursor.fetchall()
+        return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+
+def save_session_message(session_id: str, role: str, content: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO sessions (session_id, role, content) 
+            VALUES (?, ?, ?)
+        ''', (session_id, role, content))
+        conn.commit()
+
+def process_message(message: str, session_id: Optional[str]) -> Dict:
+    message = message.strip()
+    if not message:
+        return {"error": "Empty message"}
+        
+    history = []
+    if session_id:
+        history = get_session_history(session_id)
+        
+    # Contextualize Query
+    if history:
+        contextualized_query = engine.contextualize_query(message, history, LLM_CLIENT, LLM_MODEL)
+    else:
+        contextualized_query = message
+        
+    # Semantic Cache Logic Layer 1: Exact Match
+    query_hash = hashlib.sha256(contextualized_query.encode("utf-8")).hexdigest()
+    
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT response FROM semantic_cache WHERE query_hash = ?', (query_hash,))
+        row = cursor.fetchone()
+        if row:
+            logging.info("Semantic Cache Layer 1 (Exact Match) hit for query: %s", contextualized_query)
+            result = json.loads(row[0])
+            if session_id:
+                save_session_message(session_id, "user", message)
+                save_session_message(session_id, "assistant", result.get("full_answer", ""))
+            return result
+            
+        # Semantic Cache Layer 2: Semantic Match
+        query_vecs = engine.get_embeddings([contextualized_query], LLM_CLIENT)
+        query_vec = None
+        if query_vecs:
+            query_vec = query_vecs[0]
+            cursor.execute('SELECT query_hash, embedding, response FROM semantic_cache')
+            all_caches = cursor.fetchall()
+            
+            import torch
+            from sentence_transformers import util
+            query_tensor = torch.tensor(query_vec)
+            
+            best_sim = -1.0
+            best_response = None
+            for chash, cemb_str, cresp_str in all_caches:
+                cemb = json.loads(cemb_str)
+                cemb_tensor = torch.tensor(cemb)
+                sim = util.cos_sim(query_tensor, cemb_tensor).item()
+                if sim > best_sim:
+                    best_sim = sim
+                    best_response = cresp_str
+            
+            if best_sim >= 0.95 and best_response:
+                logging.info("Semantic Cache Layer 2 (Semantic Match) hit with sim %.4f for query: %s", best_sim, contextualized_query)
+                result = json.loads(best_response)
+                if session_id:
+                    save_session_message(session_id, "user", message)
+                    save_session_message(session_id, "assistant", result.get("full_answer", ""))
+                return result
+                
+    # Fallback to normal RAG if cache misses
+    result = engine.answer_query(contextualized_query, engine.FAQ_RECORDS, LLM_CLIENT, LLM_MODEL)
+    
+    # Save to Cache & Session
+    if session_id:
+        save_session_message(session_id, "user", message)
+        save_session_message(session_id, "assistant", result.get("full_answer", ""))
+        
+    if query_vec:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO semantic_cache (query_hash, query, embedding, response) 
+                VALUES (?, ?, ?, ?)
+            ''', (query_hash, contextualized_query, json.dumps(query_vec), json.dumps(result)))
+            conn.commit()
+
+    return result
+
+
+
 
 @app.route("/", methods=["GET"])
 def index() -> str:
@@ -86,8 +214,20 @@ def index() -> str:
 def api_chat():
     payload = request.get_json(silent=True) or {}
     message = payload.get("message", "")
-    result = engine.answer_query(message, engine.FAQ_RECORDS, LLM_CLIENT, LLM_MODEL)
+    session_id = payload.get("session_id", "")
+    result = process_message(message, session_id)
     return jsonify(result)
+
+@app.route("/api/chat/clear", methods=["POST"])
+def api_chat_clear():
+    payload = request.get_json(silent=True) or {}
+    session_id = payload.get("session_id")
+    if session_id:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM sessions WHERE session_id = ?', (session_id,))
+            conn.commit()
+    return jsonify({"status": "ok"})
 
 
 @app.route("/api/faq/<record_id>", methods=["GET"])
@@ -207,8 +347,11 @@ def webhook():
 
         reply_token = event.get("replyToken")
         user_text = message.get("text", "")
-        result = engine.answer_query(user_text, engine.FAQ_RECORDS, LLM_CLIENT, LLM_MODEL)
-        reply_line_message(reply_token, result["full_answer"], LINE_ACCESS_TOKEN)
+        source = event.get("source", {})
+        session_id = source.get("userId")
+        
+        result = process_message(user_text, session_id)
+        reply_line_message(reply_token, result.get("full_answer", ""), LINE_ACCESS_TOKEN)
 
     return "OK"
 

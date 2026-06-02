@@ -55,6 +55,12 @@ let currentPage = 1;
 let currentPageSize = 20;
 let currentSearchField = "all";
 
+let sessionId = localStorage.getItem("chatbot_session_id");
+if (!sessionId) {
+  sessionId = crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 15);
+  localStorage.setItem("chatbot_session_id", sessionId);
+}
+
 /**
  * Adds a message to the chat log with an animation and optional citation tags.
  * @param {string} text 
@@ -132,7 +138,7 @@ async function sendMessage(message) {
   const response = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message })
+    body: JSON.stringify({ message, session_id: sessionId })
   });
 
   if (!response.ok) {
@@ -709,9 +715,22 @@ if (btnSidebarExpand) {
 
 // 清除歷史按鈕監聽
 if (btnClearChat) {
-  btnClearChat.addEventListener("click", () => {
+  btnClearChat.addEventListener("click", async () => {
     if (confirm("確定要清除所有的對話歷史紀錄嗎？")) {
       localStorage.removeItem("chatbot_history");
+      if (sessionId) {
+        try {
+          await fetch("/api/chat/clear", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: sessionId })
+          });
+        } catch (e) {
+          console.error("Failed to clear backend session", e);
+        }
+      }
+      sessionId = crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 15);
+      localStorage.setItem("chatbot_session_id", sessionId);
       chatLog.innerHTML = "";
       addMessage("您好！我是您的專利行政助理。您可以詢問任何關於專利申請、規費、程序或法律相關的問題。", "bot");
     }
