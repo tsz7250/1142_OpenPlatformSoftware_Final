@@ -15,6 +15,7 @@ import requests
 from flask import Flask, abort, jsonify, render_template, request
 from openai import OpenAI
 from dotenv import load_dotenv
+from linebot.v3.messaging import ApiClient, Configuration, MessagingApi, ShowLoadingAnimationRequest
 
 # 導入核心檢索與 AI 引擎
 import engine
@@ -62,9 +63,26 @@ def reply_line_message(reply_token: str, text: str, access_token: str) -> None:
         logging.exception("LINE reply failed")
 
 
+def show_line_loading_animation(chat_id: str, loading_seconds: int = 60) -> None:
+    if not chat_id or not LINE_MESSAGING_CONFIGURATION:
+        return
+    try:
+        with ApiClient(LINE_MESSAGING_CONFIGURATION) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.show_loading_animation(
+                ShowLoadingAnimationRequest(
+                    chat_id=chat_id,
+                    loading_seconds=loading_seconds,
+                )
+            )
+    except Exception:
+        logging.exception("LINE loading animation failed")
+
+
 # LINE credentials - read from environment if available (empty string fallback)
 LINE_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 LINE_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
+LINE_MESSAGING_CONFIGURATION = Configuration(access_token=LINE_ACCESS_TOKEN) if LINE_ACCESS_TOKEN else None
 
 # LMStudio settings
 LMSTUDIO_BASE_URL = "http://localhost:1234/v1"
@@ -122,6 +140,20 @@ def save_session_message(session_id: str, role: str, content: str):
             VALUES (?, ?, ?)
         ''', (session_id, role, content))
         conn.commit()
+
+
+def clear_session_history(session_id: str) -> None:
+    if not session_id:
+        return
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM sessions WHERE session_id = ?', (session_id,))
+        conn.commit()
+
+
+def is_reset_command(message: str) -> bool:
+    normalized = (message or "").strip().lower()
+    return normalized == "/reset"
 
 def process_message(message: str, session_id: Optional[str]) -> Dict:
     message = message.strip()
@@ -223,10 +255,7 @@ def api_chat_clear():
     payload = request.get_json(silent=True) or {}
     session_id = payload.get("session_id")
     if session_id:
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM sessions WHERE session_id = ?', (session_id,))
-            conn.commit()
+        clear_session_history(session_id)
     return jsonify({"status": "ok"})
 
 
@@ -349,6 +378,14 @@ def webhook():
         user_text = message.get("text", "")
         source = event.get("source", {})
         session_id = source.get("userId")
+
+        if session_id and is_reset_command(user_text):
+            clear_session_history(session_id)
+            reply_line_message(reply_token, "已清除對話歷史，現在開始新對話。", LINE_ACCESS_TOKEN)
+            continue
+
+        if source.get("type") == "user" and session_id:
+            show_line_loading_animation(session_id, 60)
         
         result = process_message(user_text, session_id)
         reply_line_message(reply_token, result.get("full_answer", ""), LINE_ACCESS_TOKEN)

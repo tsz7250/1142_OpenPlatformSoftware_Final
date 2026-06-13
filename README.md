@@ -120,6 +120,12 @@ python app.py
 - 開啟瀏覽器進入 `http://localhost:5000` 即可訪問網頁版 Web UI 介面。
 - 若設定了 LINE 變數，可將 Webhook URL 指向您的 `https://<your-domain>/callback`。
 
+### 5. LINE Bot 對話重置
+
+在 LINE 對話中輸入 `/reset`，可以清除目前使用者的對話歷史並開始新對話。
+
+系統只會刪除該使用者的 sessions 歷史，不會影響 FAQ 資料或語意快取。
+
 ---
 
 ## 📄 授權與開源聲明

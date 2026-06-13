@@ -7,3 +7,4 @@ torch
 numpy
 openai
 python-dotenv
+line-bot-sdk
